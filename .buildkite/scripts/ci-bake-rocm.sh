@@ -989,9 +989,10 @@ registry_ref_exists_with_retry() {
             return 0
         fi
         # A definitive registry miss is normal for a new content key. Retry
-        # transport/rate-limit failures, but do not add latency to a real 404.
+        # transport/rate-limit failures, but do not add latency to explicit
+        # registry manifest-miss responses.
         if grep -Eiq \
-            'manifest unknown|name unknown|no such manifest|(^|[^0-9])404([^0-9]|$)|(^|[[:space:]])[^[:space:]]+/[^[:space:]]+:[^[:space:]]+:[[:space:]]+not found([[:space:]]|$)' \
+            'manifest[ _]unknown|name[ _]unknown|no such manifest|unexpected status from (HEAD|GET) request to https?://[^[:space:]]+/v2/[^[:space:]]+/manifests/[^[:space:]]+:[[:space:]]*404([^0-9]|$)' \
             <<< "${output}"; then
             return 1
         fi
@@ -1196,7 +1197,6 @@ configure_ci_base_image_refs() {
     local scope="${CI_BASE_WRITE_SCOPE:-}"
     local trusted_content_tag=""
     local content_tag=""
-    local commit_tag=""
     local build_tag=""
     local build_tag_name=""
     local primary_tag=""
@@ -1219,12 +1219,6 @@ configure_ci_base_image_refs() {
         echo "Invalid Buildkite commit for ci_base handoff: ${BUILDKITE_COMMIT:-<empty>}" >&2
         return 1
     fi
-    if [[ -n "${BUILDKITE_COMMIT:-}" ]]; then
-        # External AMD pod templates still consume the exact commit-scoped
-        # compatibility handoff before repository code can run.
-        commit_tag=$(ci_base_tag_with_suffix \
-            "${stable_tag}" "${BUILDKITE_COMMIT}")
-    fi
     if [[ "${BUILDKITE:-false}" == "true" \
         && -z "${BUILDKITE_BUILD_ID:-}" ]]; then
         echo "Buildkite build ID is required for the ci_base runtime handoff" >&2
@@ -1243,9 +1237,7 @@ configure_ci_base_image_refs() {
             return 1
         fi
     fi
-    CI_BASE_IMAGE_TAG_COMMIT_REF="${commit_tag}"
     CI_BASE_IMAGE_TAG_BUILD_REF="${build_tag}"
-    export CI_BASE_IMAGE_TAG_COMMIT_REF
     export CI_BASE_IMAGE_TAG_BUILD_REF
 
     if [[ -z "${CI_BASE_CONTENT_HASH:-}" ]]; then
@@ -1271,22 +1263,15 @@ configure_ci_base_image_refs() {
     primary_tag="${build_tag:-${content_tag}}"
 
     # Content tags are canonical. Untrusted jobs write content under scoped
-    # refs while still importing the trusted canonical content ref. The exact
-    # commit handoff cannot affect another commit's content discovery.
+    # refs while still importing the trusted canonical content ref.
     # Stable aliases are promoted centrally only after the test image is smoked.
     CI_BASE_IMAGE_TAG="${content_tag}"
-    if [[ -n "${commit_tag}" && "${commit_tag}" != "${content_tag}" ]]; then
-        CI_BASE_IMAGE_TAG_COMMIT_EXTRA="${commit_tag}"
-    else
-        CI_BASE_IMAGE_TAG_COMMIT_EXTRA=""
-    fi
     if [[ -n "${build_tag}" && "${build_tag}" != "${content_tag}" ]]; then
         CI_BASE_IMAGE_TAG_BUILD_EXTRA="${build_tag}"
     else
         CI_BASE_IMAGE_TAG_BUILD_EXTRA=""
     fi
     export CI_BASE_IMAGE_TAG
-    export CI_BASE_IMAGE_TAG_COMMIT_EXTRA
     export CI_BASE_IMAGE_TAG_BUILD_EXTRA
     export CI_BASE_IMAGE_TAG_CONTENT_REF
     export CI_BASE_TRUSTED_CONTENT_REF
@@ -1298,9 +1283,6 @@ configure_ci_base_image_refs() {
         export IMAGE_TAG
 
         echo "ci_base primary image tag: ${CI_BASE_IMAGE_TAG}"
-        if [[ -n "${commit_tag}" ]]; then
-            echo "ci_base commit image tag: ${commit_tag}"
-        fi
         if [[ -n "${build_tag}" ]]; then
             echo "ci_base build image tag: ${build_tag}"
         fi
@@ -1362,7 +1344,6 @@ ci_base_output_refs() {
     printf '%s\n' \
         "${IMAGE_TAG:-}" \
         "${CI_BASE_IMAGE_TAG:-}" \
-        "${CI_BASE_IMAGE_TAG_COMMIT_EXTRA:-}" \
         "${CI_BASE_IMAGE_TAG_BUILD_EXTRA:-}" \
         | awk 'NF && !seen[$0]++'
 }
@@ -1547,6 +1528,11 @@ maybe_reuse_matching_ci_base_ref() {
     if ! publish_ci_base_handoff_ref "${matching_ref}"; then
         echo "ci_base handoff validation failed; refusing to rebuild over a registry error" >&2
         return 2
+    fi
+    # Preserve a prior attempt's build latch. A missing latch on retry makes
+    # the downstream consumer choose the conservative full-image path.
+    if [[ "${BUILDKITE_RETRY_COUNT:-0}" == "0" ]]; then
+        set_buildkite_metadata "rocm-ci-base-built-in-build" "0" || return 2
     fi
     set_buildkite_metadata "rocm-ci-base-build-required" "0" || return 2
     echo "Content hashes match -- ci_base is current"
@@ -2880,12 +2866,9 @@ upload_wheel_artifacts_if_present() {
     local archive_name="vllm-rocm-install.tar.gz"
     local metadata_dir="${wheel_dir}/.vllm-ci-artifact"
     local build_base_digest=""
-    local build_base_image=""
-    local expected_build_base_image=""
     local expected_native_base_image=""
     local native_base_image=""
     local native_base_digest=""
-    local base_alias=""
     local whl=""
     local whl_name=""
     local -a wheels=()
@@ -2903,8 +2886,7 @@ upload_wheel_artifacts_if_present() {
     fi
     whl="${wheels[0]}"
     whl_name=$(basename "${whl}")
-    native_base_image="${CI_BASE_IMAGE_TAG_COMMIT_REF:-${CI_BASE_IMAGE:-}}"
-    build_base_image="${CI_BASE_IMAGE_TAG_BUILD_REF:-}"
+    native_base_image="${CI_BASE_IMAGE_TAG_BUILD_REF:-${CI_BASE_IMAGE:-}}"
     if [[ -z "${native_base_image}" ]]; then
         echo "Native ROCm artifact requires a ci_base image reference" >&2
         return 1
@@ -2912,16 +2894,9 @@ upload_wheel_artifacts_if_present() {
     if [[ "${BUILDKITE:-false}" == "true" ]]; then
         expected_native_base_image=$(ci_base_tag_with_suffix \
             "${CI_BASE_STABLE_PROMOTION_REF:-rocm/vllm-dev:ci_base}" \
-            "${BUILDKITE_COMMIT:-}")
-        if [[ "${native_base_image}" != "${expected_native_base_image}" ]]; then
-            echo "Native ROCm artifact requires the exact ci_base commit handoff: ${native_base_image}" >&2
-            return 1
-        fi
-        expected_build_base_image=$(ci_base_tag_with_suffix \
-            "${CI_BASE_STABLE_PROMOTION_REF:-rocm/vllm-dev:ci_base}" \
             "build-${BUILDKITE_BUILD_ID:-}")
-        if [[ "${build_base_image}" != "${expected_build_base_image}" ]]; then
-            echo "Native ROCm artifact requires the exact ci_base build handoff: ${build_base_image:-<empty>}" >&2
+        if [[ "${native_base_image}" != "${expected_native_base_image}" ]]; then
+            echo "Native ROCm artifact requires the exact ci_base build handoff: ${native_base_image}" >&2
             return 1
         fi
         if [[ ! "${CI_BASE_IMAGE:-}" =~ @sha256:[0-9a-f]{64}$ ]]; then
@@ -2929,18 +2904,16 @@ upload_wheel_artifacts_if_present() {
             return 1
         fi
         build_base_digest="${CI_BASE_IMAGE##*@}"
-        for base_alias in "${native_base_image}" "${build_base_image}"; do
-            if ! native_base_digest=$(resolve_image_digest "${base_alias}"); then
-                echo "Could not resolve native ci_base handoff: ${base_alias}" >&2
-                return 1
-            fi
-            if [[ "${native_base_digest}" != "${build_base_digest}" ]]; then
-                echo "Native ci_base handoff does not match the artifact build base" >&2
-                echo "  native: ${base_alias}@${native_base_digest}" >&2
-                echo "  build:  ${CI_BASE_IMAGE}" >&2
-                return 1
-            fi
-        done
+        if ! native_base_digest=$(resolve_image_digest "${native_base_image}"); then
+            echo "Could not resolve native ci_base handoff: ${native_base_image}" >&2
+            return 1
+        fi
+        if [[ "${native_base_digest}" != "${build_base_digest}" ]]; then
+            echo "Native ci_base handoff does not match the artifact build base" >&2
+            echo "  native: ${native_base_image}@${native_base_digest}" >&2
+            echo "  build:  ${CI_BASE_IMAGE}" >&2
+            return 1
+        fi
     fi
 
     echo "--- :package: Uploading ROCm vLLM install artifact"
@@ -2949,8 +2922,6 @@ upload_wheel_artifacts_if_present() {
 
     printf '%s\n' "${BUILDKITE_COMMIT:-local}" > "${metadata_dir}/commit.txt"
     printf '%s\n' "${native_base_image}" > "${metadata_dir}/native-base-image.txt"
-    printf '%s\n' "${native_base_image}" "${build_base_image}" \
-        | awk 'NF && !seen[$0]++' > "${metadata_dir}/native-base-images.txt"
     printf '%s\n' "${CI_BASE_IMAGE:-}" > "${metadata_dir}/ci-base-image.txt"
     printf '%s\n' "${IMAGE_TAG:-}" > "${metadata_dir}/fallback-image.txt"
     printf '%s\n' "${whl_name}" > "${metadata_dir}/wheel-filename.txt"
@@ -2990,9 +2961,7 @@ main() {
     fi
     compute_ci_base_hash_if_needed
     configure_ci_base_image_refs
-    if ! maybe_skip_existing_image; then
-        return 1
-    fi
+    maybe_skip_existing_image || return "$?"
     setup_builder
     prepare_git_cache_metadata
     # Non-ci_base builds may deepen a shallow checkout above. Derive archival
@@ -3024,6 +2993,7 @@ main() {
         rm -rf ./wheel-export
     fi
     if is_ci_base_target; then
+        set_buildkite_metadata "rocm-ci-base-built-in-build" "1" || return 1
         set_buildkite_metadata "rocm-ci-base-build-required" "1" || return 1
     fi
     if ! seed_dependency_caches_if_needed; then

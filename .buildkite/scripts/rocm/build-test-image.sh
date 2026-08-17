@@ -88,7 +88,9 @@ validate_selected_base() {
 
 main() {
     local base_build_required=""
+    local base_built_in_build=""
     local ci_base_build_required=""
+    local ci_base_built_in_build=""
     local expected_smoke_image=""
     local legacy_commit_image=""
     local smoke_image="${VLLM_CI_SMOKE_IMAGE:-${IMAGE_TAG:-}}"
@@ -121,10 +123,14 @@ main() {
     fi
 
     base_build_required="$(metadata_get rocm-base-build-required)"
+    base_built_in_build="$(metadata_get rocm-base-built-in-build)"
     ci_base_build_required="$(metadata_get rocm-ci-base-build-required)"
+    ci_base_built_in_build="$(metadata_get rocm-ci-base-built-in-build)"
     if [[ "${ROCM_CI_ARTIFACT_ONLY:-0}" == "1" \
         && "${base_build_required}" == "0" \
-        && "${ci_base_build_required}" == "0" ]] \
+        && "${ci_base_build_required}" == "0" \
+        && "${base_built_in_build}" == "0" \
+        && "${ci_base_built_in_build}" == "0" ]] \
         && ! is_trusted_main_build; then
         echo "ROCM_CI_ARTIFACT_ONLY=1; building ROCm wheel artifact only"
         metadata_set rocm-ci-image-smoke-required 0

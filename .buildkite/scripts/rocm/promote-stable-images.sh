@@ -45,6 +45,10 @@ is_pinned() {
     [[ "${1:-}" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
 }
 
+is_tagged() {
+    [[ "${1:-}" =~ ^[^[:space:]@]+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+}
+
 is_safe_git_path() {
     local path="${1:-}"
 
@@ -63,7 +67,7 @@ repository_of() {
 
 is_missing() {
     grep -Eqi \
-        'manifest unknown|name unknown|no such manifest|(^|[^0-9])404([^0-9]|$)|(^|[[:space:]])[^[:space:]]+/[^[:space:]]+:[^[:space:]]+:[[:space:]]+not found([[:space:]]|$)' \
+        'manifest[ _]unknown|name[ _]unknown|no such manifest|unexpected status from (HEAD|GET) request to https?://[^[:space:]]+/v2/[^[:space:]]+/manifests/[^[:space:]]+:[[:space:]]*404([^0-9]|$)' \
         <<< "$1"
 }
 
@@ -121,6 +125,7 @@ validate_candidates() {
     local base_hash="" base_version="" base_parent_ref="" base_parent=""
     local base_file="" ci_hash="" ci_version="" ci_parent_ref=""
     local ci_parent="" ci_files=""
+    local checked_in_parent="" checked_in_parent_digest=""
     local expected_base_version="${ROCM_BASE_METADATA_VERSION:-2}"
     local expected_ci_version="${CI_BASE_METADATA_VERSION:-3}"
     local base_format='{{ index .Image.Config.Labels "vllm.rocm_base.content_hash" }}|{{ index .Image.Config.Labels "vllm.rocm_base.metadata_version" }}|{{ index .Image.Config.Labels "vllm.rocm_base.base_image" }}|{{ index .Image.Config.Labels "vllm.rocm_base.base_image_digest" }}|{{ index .Image.Config.Labels "vllm.rocm_base.dockerfile" }}'
@@ -175,6 +180,23 @@ validate_candidates() {
         echo "ROCm promotion candidate identity or parent relation is invalid" >&2
         return 1
     fi
+    if ! is_safe_git_path "${base_file}"; then
+        echo "Invalid ROCm base parent metadata" >&2
+        return 1
+    fi
+    checked_in_parent=$(git show "${BUILDKITE_COMMIT}:${base_file}" \
+        | sed -n -E \
+            's/^[[:space:]]*ARG[[:space:]]+BASE_IMAGE="?([^"[:space:]]+)"?.*/\1/p' \
+        | head -1)
+    if [[ -z "${checked_in_parent}" ]]; then
+        echo "Could not resolve BASE_IMAGE from ${base_file}" >&2
+        return 1
+    fi
+    checked_in_parent_digest=$(lookup_digest "${checked_in_parent}") || return 1
+    if [[ "${checked_in_parent_digest}" != "${base_parent}" ]]; then
+        echo "ROCm base parent does not match the checked-in Dockerfile" >&2
+        return 1
+    fi
 }
 
 validate_smoke() {
@@ -208,33 +230,6 @@ validate_smoke() {
     if [[ "${revision,,}" != "${BUILDKITE_COMMIT,,}" \
         || "${smoke_ci}" != "${ci}" ]]; then
         echo "Smoked image revision or ci_base parent does not match this build" >&2
-        return 1
-    fi
-}
-
-validate_checked_in_parent() {
-    local base="$1" values="" parent_digest="" dockerfile=""
-    local parent_ref="" checked_in_digest=""
-    local format='{{ index .Image.Config.Labels "vllm.rocm_base.base_image_digest" }}|{{ index .Image.Config.Labels "vllm.rocm_base.dockerfile" }}'
-
-    values=$(inspect_labels "${base}" "${format}") || return 1
-    IFS='|' read -r parent_digest dockerfile <<< "${values}"
-    if [[ ! "${parent_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-        || ! is_safe_git_path "${dockerfile}"; then
-        echo "Invalid ROCm base parent metadata" >&2
-        return 1
-    fi
-    parent_ref=$(git show "${BUILDKITE_COMMIT}:${dockerfile}" \
-        | sed -n -E \
-            's/^[[:space:]]*ARG[[:space:]]+BASE_IMAGE="?([^"[:space:]]+)"?.*/\1/p' \
-        | head -1)
-    if [[ -z "${parent_ref}" ]]; then
-        echo "Could not resolve BASE_IMAGE from ${dockerfile}" >&2
-        return 1
-    fi
-    checked_in_digest=$(lookup_digest "${parent_ref}") || return 1
-    if [[ "${checked_in_digest}" != "${parent_digest}" ]]; then
-        echo "ROCm base parent does not match the checked-in Dockerfile" >&2
         return 1
     fi
 }
@@ -282,9 +277,21 @@ main() {
     local base="" base_hash="" base_content="" base_stable=""
     local ci="" ci_content="" ci_build="" parent=""
     local required="" smoke_ref="" smoked="" smoked_ref=""
-    local status=0 failed=0 needs_write=0 bootstrap_v3=0 actual="" source="" i=0
+    local status=0 failed=0 needs_write=0 bootstrap_v3=0 transaction_active=0
+    local actual="" source="" i=0
     local -a aliases=()
     local -a previous=("" "" "") candidates=()
+
+    rollback_transaction() {
+        local rollback_status=0
+
+        ((transaction_active == 1)) || return 0
+        transaction_active=0
+        rollback_aliases aliases previous || rollback_status=$?
+        ((rollback_status == 0)) \
+            || echo "One or more aliases could not be restored" >&2
+        return 0
+    }
 
     is_trusted_main \
         || { echo "Skipping stable ROCm promotion outside trusted main"; return 0; }
@@ -313,8 +320,9 @@ main() {
         echo "Configured ci_base stable cache ref does not match ${ci_versioned}" >&2
         return 1
     fi
-    if [[ "$(repository_of "${ci_stable}")" != "${repo}" ]]; then
-        echo "Stable base and ci_base aliases must share the configured repository" >&2
+    if ! is_tagged "${ci_stable}" \
+        || [[ "$(repository_of "${ci_stable}")" != "${repo}" ]]; then
+        echo "Stable ci_base must be an explicit tag in the configured repository" >&2
         return 1
     fi
     aliases=("${repo}:base" "${ci_stable}" "${ci_versioned}")
@@ -326,7 +334,6 @@ main() {
         "${ci_content}" "${ci_build}"
     validate_smoke \
         "${required}" "${smoke_ref}" "${smoked}" "${smoked_ref}" "${ci}"
-    validate_checked_in_parent "${base}"
 
     for i in "${!aliases[@]}"; do
         status=0
@@ -365,6 +372,11 @@ main() {
         previous[2]="${previous[1]}"
     fi
 
+    transaction_active=1
+    trap 'status=$?; trap - EXIT INT TERM; rollback_transaction; exit "${status}"' EXIT
+    trap 'trap - EXIT INT TERM; rollback_transaction; exit 130' INT
+    trap 'trap - EXIT INT TERM; rollback_transaction; exit 143' TERM
+
     docker buildx imagetools create --prefer-index=false \
         -t "${aliases[0]}" "${base}" || failed=1
     if ((failed == 0)); then
@@ -380,10 +392,12 @@ main() {
     fi
     if ((failed)); then
         echo "Stable ROCm promotion failed; rolling back all aliases" >&2
-        rollback_aliases aliases previous \
-            || echo "One or more aliases could not be restored" >&2
+        rollback_transaction
+        trap - EXIT INT TERM
         return 1
     fi
+    transaction_active=0
+    trap - EXIT INT TERM
     echo "Stable ROCm aliases now reference the validated candidates"
 }
 

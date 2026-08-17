@@ -218,7 +218,7 @@ remote_image_exists() {
             return 0
         fi
         if grep -Eqi \
-            'manifest unknown|name unknown|no such manifest|(^|[^0-9])404([^0-9]|$)|(^|[[:space:]])[^[:space:]]+/[^[:space:]]+:[^[:space:]]+:[[:space:]]+not found([[:space:]]|$)' \
+            'manifest[ _]unknown|name[ _]unknown|no such manifest|unexpected status from (HEAD|GET) request to https?://[^[:space:]]+/v2/[^[:space:]]+/manifests/[^[:space:]]+:[[:space:]]*404([^0-9]|$)' \
             <<< "${output}"; then
             return 1
         fi
@@ -522,6 +522,7 @@ build_base_image() {
             return 1
         fi
         build_required=1
+        metadata_set "rocm-base-built-in-build" "1"
         build_ref="${writable_content_tag}"
         echo "No reusable ROCm base content image found; building ${build_ref}"
         setup_builder
@@ -566,6 +567,12 @@ build_base_image() {
     metadata_set "rocm-base-content-hash" "${base_hash}"
     metadata_set "rocm-base-image-content" "${immutable_ref%@*}"
     metadata_set "rocm-base-image-stable" "${stable_tag}"
+    # Do not overwrite a build latch on retry. If an earlier attempt did not
+    # publish an outcome, the missing key makes the consumer build fully.
+    if ((build_required == 0)) \
+        && [[ "${BUILDKITE_RETRY_COUNT:-0}" == "0" ]]; then
+        metadata_set "rocm-base-built-in-build" "0"
+    fi
     metadata_set "rocm-base-build-required" "${build_required}"
     metadata_set "rocm-base-cache-hit" "${cache_hit}"
 
