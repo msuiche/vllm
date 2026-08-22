@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"H=spark-4687.local\\nTAG=ghcr.io/bjk110/vllm-spark:v027-ngc2607-dsv4-0731-dspark-k7-256k-production\\ntimeout 20 ssh -o BatchMode=yes $H \\\"pkill -f 'docker pull ghcr.io/bjk110'; sleep 2; noh...",
+  "error": "Exit code 1\ngrep: /tmp/pull2.log: No such file or directory\n  layers complete: \ngrep: /tmp/pull2.log: No such file or directory\n  retrying now:    \ntail: cannot open '/tmp/pull2.log' for reading: No such file or directory",
+  "timestamp": "2026-08-17T07:07:46.720Z",
+  "retry_count": 1
+}
